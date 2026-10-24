@@ -21,14 +21,16 @@ const FORCE_PROXY_DOMAINS = [
 ];
 
 // 强制屏蔽
-const CUSTOM_BLOCK_DOMAINS = [ "blocked.com", "blocked.org" ];
+const CUSTOM_BLOCK_DOMAINS = [ "blocked.com", "blocked.org"
+];
 
-// 自定义节点过滤（用 | 分割)
-const CUSTOM_FILTER = /示例占位符1|示例占位符2|示例占位符3/i;
+// 自定义节点过滤（用 | 分割）
+const CUSTOM_FILTER = /示例占位符1|示例占位符2|示例占位符3/
 
 // ====================
 // 1. 常量配置
 // ====================
+
 const SETTINGS = {
   ICON_BASE: "https://fastly.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/",
   RULE_PROVIDER_URL_BASE: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo",
@@ -53,13 +55,66 @@ const SETTINGS = {
     "max-failed-times": 1,
   },
 
-  INFO_FILTER: /tg|telegram|倒卖|到期|电报|订阅|发布|防止|返利|购买|官方|官网|工单|过期|规则|建议|客服|联系|流量|剩余|失联|网址|邮箱|续费|邀请|重置|梯子|群|永久免费/i
+  INFO_FILTER: /mcii-keep|tg|telegram|倒卖|到期|电报|订阅|发布|防止|返利|购买|官方|官网|工单|过期|规则|建议|客服|联系|流量|剩余|失联|网址|邮箱|续费|邀请|重置|梯子|群|永久免费|节点来自/i
 };
 
 // ====================
 // 2. 基础工具
 // ====================
+
 const uniq = (arr = []) => [...new Set(arr.filter(Boolean))];
+
+// 可能导致内核 go-yaml 报错的字符:
+const UNSAFE_CHARS_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\uFFFE\uFFFF]|[\uD800-\uDFFF]/;
+
+// 剔除字符串中的非法控制字符（保留 \t \n \r）与孤立代理对
+const sanitizeString = (value = "") => {
+  if (typeof value !== "string" || !value || !UNSAFE_CHARS_RE.test(value)) return value;
+
+  let out = "";
+  for (let i = 0; i < value.length; i++) {
+    const c = value.charCodeAt(i);
+
+    if (c >= 0xd800 && c <= 0xdbff) {
+      const next = value.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        out += value[i] + value[i + 1];
+        i++;
+      }
+      continue;
+    }
+    if (c >= 0xdc00 && c <= 0xdfff) continue;
+
+    if (
+      (c <= 0x1f && c !== 0x09 && c !== 0x0a && c !== 0x0d) ||
+      c === 0x7f ||
+      (c >= 0x80 && c <= 0x9f) ||
+      c === 0xfffe ||
+      c === 0xffff
+    ) {
+      continue;
+    }
+
+    out += value[i];
+  }
+
+  return out;
+};
+
+// 递归清洗配置对象的所有字符串键值，避免序列化后内核报 `yaml: control characters are not allowed`
+
+const sanitizeConfig = (value) => {
+  if (typeof value === "string") return sanitizeString(value);
+  if (Array.isArray(value)) return value.map(sanitizeConfig);
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const key in value) {
+      out[sanitizeString(key)] = sanitizeConfig(value[key]);
+    }
+    return out;
+  }
+  return value;
+};
 
 const escapeRegex = (s = "") =>
   String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -114,7 +169,7 @@ const buildRegions = () =>
       name: "US",
       pattern: [
         "美国", "纽约", "旧金山", "洛杉矶", "西雅图", "芝加哥",
-        "US", "USA",
+        "US", "USA", "United States",
         "NEWYORK", "NEW YORK",
         "SANFRANCISCO", "SAN FRANCISCO",
         "LOSANGELES", "LOS ANGELES",
@@ -168,11 +223,13 @@ const pickDirectRules = (rules = []) =>
 // ====================
 // 3. 规则集与固定规则
 // ====================
+
 const RULE_PROVIDERS_DOMAINS = [
   "category-ads-all", "private", "google-cn", "synology", "microsoft@cn",
   "category-game-platforms-download@cn", "category-ai-!cn", "telegram", "gfw", "cn",
   "googlefcm", "epicgames", "nvidia@cn", "cloudflare@cn", "steam@cn",
-  "category-ntp", "connectivity-check", "apple", "spotify", "microsoft"
+  "category-ntp", "connectivity-check", "apple", "spotify", "microsoft",
+  "soundcloud"
 ];
 
 const RULE_PROVIDERS_IPS = [
@@ -240,6 +297,7 @@ const STATIC_RULES = [
   "RULE-SET,category-game-platforms-download@cn,DIRECT",
   "RULE-SET,category-ai-!cn,ai",
   "RULE-SET,telegram,tg",
+  "RULE-SET,soundcloud,sc",
   "RULE-SET,gfw,main",
   "RULE-SET,cn,DIRECT",
   "RULE-SET,cn-ip,DIRECT,no-resolve",
@@ -251,6 +309,7 @@ const STATIC_FAKE_IP_FILTER = buildFakeIpFilter(BYPASS_DOMAINS);
 // ====================
 // 4. 节点处理
 // ====================
+
 const ensureConfigObject = (input) =>
   input && typeof input === "object" ? input : {};
 
@@ -283,11 +342,18 @@ const makeProxyNamesUnique = (proxies = []) => {
   });
 };
 
-const filterCustomProxies = (proxies = [], customFilter) =>
-  proxies.filter((proxy) => {
-    if (!proxy || !proxy.name) return false;
-    return !customFilter.test(proxy.name);
+// 命中过滤规则的节点进入 excluded 分类，其余保留
+const splitCustomProxies = (proxies = [], customFilter) => {
+  const excludedProxies = [];
+  const keptProxies = [];
+
+  proxies.forEach((proxy) => {
+    if (!proxy || !proxy.name) return;
+    (customFilter.test(proxy.name) ? excludedProxies : keptProxies).push(proxy);
   });
+
+  return { excludedProxies, keptProxies };
+};
 
 const splitInfoAndNormalProxies = (proxies = [], infoFilter) =>
   proxies.reduce(
@@ -350,13 +416,15 @@ const buildAllAiProxyList = (activeRegions = [], otherProxyNames = [], allNames 
 // ====================
 // 5. 策略组
 // ====================
+
 const buildProxyGroups = ({
   allNames,
   allAiNames,
   activeRegionMap,
   activeRegionNameSet,
   otherProxyNames,
-  infoNames
+  infoNames,
+  excludedNames
 }) => {
   const groups = [];
 
@@ -377,17 +445,11 @@ const buildProxyGroups = ({
 
   const regionEntries = SETTINGS.REGION_ORDER.filter((rName) => activeRegionNameSet.has(rName));
 
-  // main 组
+ // main 组
   if (allNames.length) {
-    const mainEntries = ["All", ...regionEntries];
+    const mainEntries = ["ALL", ...regionEntries];
     if (otherProxyNames.length) mainEntries.push("Other");
     add("main", "select", mainEntries, "Available.png");
-  }
-
-  // All 组
-  if (allNames.length) {
-    add("URL Test - All", "url-test", allNames, "Auto.png", SETTINGS.URL_TEST_EXTRA);
-    add("All", "select", ["URL Test - All", ...allNames], "Auto.png");
   }
 
   // ai 组（包含地区子分组，排除 HK）
@@ -395,35 +457,21 @@ const buildProxyGroups = ({
     const aiRegionEntries = SETTINGS.REGION_ORDER.filter(
       (rName) => rName !== "HK" && activeRegionNameSet.has(rName)
     );
-    const aiEntries = ["All-ai", ...aiRegionEntries];
+    const aiEntries = ["ALL-AI", ...aiRegionEntries];
     if (otherProxyNames.length) aiEntries.push("Other");
     add("ai", "select", aiEntries, "ChatGPT.png");
   }
 
-  // All-ai 组（排除 HK 的所有节点）
-  if (allAiNames.length) {
-    add("URL Test - All-ai", "url-test", allAiNames, "ChatGPT.png", SETTINGS.URL_TEST_EXTRA);
-    add("All-ai", "select", ["URL Test - All-ai", ...allAiNames], "ChatGPT.png");
+  // ALL 组
+  if (allNames.length) {
+    add("URL Test - ALL", "url-test", allNames, "Auto.png", SETTINGS.URL_TEST_EXTRA);
+    add("ALL", "select", ["URL Test - ALL", ...allNames], "Auto.png");
   }
 
-  // tg 组
-  if (allNames.length) {
-    const hasSG = activeRegionNameSet.has("SG");
-
-    add(
-      "tg - Fallback",
-      "fallback",
-      hasSG ? ["SG", "main"] : ["main"],
-      "Telegram.png",
-      SETTINGS.FALLBACK_TEST_EXTRA
-    );
-
-    add(
-      "tg",
-      "select",
-      ["tg - Fallback", ...(hasSG ? ["SG"] : []), "main"],
-      "Telegram.png"
-    );
+  // ALL-AI 组（排除 HK 的所有节点）
+  if (allAiNames.length) {
+    add("URL Test - ALL-AI", "url-test", allAiNames, "ChatGPT.png", SETTINGS.URL_TEST_EXTRA);
+    add("ALL-AI", "select", ["URL Test - ALL-AI", ...allAiNames], "ChatGPT.png");
   }
 
   // 地区分组
@@ -441,9 +489,41 @@ const buildProxyGroups = ({
     add("Other", "select", ["URL Test - Other", ...otherProxyNames], "Available.png");
   }
 
+  // tg 组
+  if (allNames.length) {
+    const hasSG = activeRegionNameSet.has("SG");
+
+    add("tg-fallback", "fallback", hasSG ? ["SG", "main"] : ["main"], "Telegram.png", {
+      ...SETTINGS.FALLBACK_TEST_EXTRA,
+      hidden: true
+    });
+
+    add("tg", "select", ["tg-fallback", ...(hasSG ? ["SG"] : []), "main"], "Telegram.png");
+  }
+
+  // sc 组（SoundCloud对节点纯净度要求高，默认经 ai）
+  const scEntries = [
+    ...(allAiNames.length ? ["ai"] : []),
+    ...(allNames.length ? ["main"] : [])
+  ];
+  if (scEntries.length) {
+    add("sc-fallback", "fallback", scEntries, "Music_Enhance.png", {
+      ...SETTINGS.FALLBACK_TEST_EXTRA,
+      hidden: true
+    });
+
+    // sc-fallback
+    add("sc", "select", [...scEntries, "sc-fallback"], "Music_Enhance.png");
+  }
+
   // info 组
   if (infoNames.length) {
     add("info", "select", infoNames, "Available.png");
+  }
+
+  // excluded 组：只读
+  if (excludedNames.length) {
+    add("excluded", "select", excludedNames, "Lock.png");
   }
 
   // GLOBAL 组
@@ -451,11 +531,14 @@ const buildProxyGroups = ({
     "GLOBAL",
     "select",
     [
-      ...(allNames.length ? ["main", "All"] : []),
-      ...(allAiNames.length ? ["ai", "All-ai"] : []),
-      ...(allNames.length ? ["tg"] : []),
+      ...(allNames.length ? ["main"] : []),
+      ...(allAiNames.length ? ["ai"] : []),
+      ...(allNames.length ? ["ALL"] : []),
+      ...(allAiNames.length ? ["ALL-AI"] : []),
       ...regionEntries,
       ...(otherProxyNames.length ? ["Other"] : []),
+      ...(allNames.length ? ["tg"] : []),
+      ...(scEntries.length ? ["sc"] : []),
       ...(infoNames.length ? ["info"] : [])
     ],
     "Global.png"
@@ -467,6 +550,7 @@ const buildProxyGroups = ({
 // ====================
 // 6. 网络配置
 // ====================
+
 const removeGeoDataConfig = (cfg) => {
   delete cfg["geodata-mode"];
   delete cfg["geo-auto-update"];
@@ -511,7 +595,10 @@ const applyDns = (cfg) => {
     "https://doh.pub/dns-query"
   ];
 
-  const foreignDNS = ["https://1.1.1.1/dns-query#main"];
+  const CustomDNS = [
+    "https://edge.1molchuan.top/linuxdo",
+    "https://edge.1molchuan.top/plus"
+  ];
 
   const directRuleSetsForChinaDNS = [
     "rule-set:cn",
@@ -520,7 +607,6 @@ const applyDns = (cfg) => {
     "rule-set:googlefcm",
     "rule-set:epicgames",
     "rule-set:nvidia@cn",
-    "rule-set:microsoft@cn",
     "rule-set:cloudflare@cn",
     "rule-set:steam@cn",
     "rule-set:category-game-platforms-download@cn",
@@ -555,7 +641,7 @@ const applyDns = (cfg) => {
     "fake-ip-filter-mode": "blacklist",
     "fake-ip-filter": fullFakeIpFilter,
     "default-nameserver": ["223.5.5.5", "119.29.29.29"],
-    nameserver: foreignDNS,
+    nameserver: CustomDNS,
     "proxy-server-nameserver": [
       "https://doh.pub/dns-query#DIRECT",
       "https://dns.alidns.com/dns-query#DIRECT"
@@ -581,15 +667,17 @@ const applyProfile = (cfg) => {
 };
 
 const applyRuntime = (cfg) => {
-  cfg.mode = "rule";
+  // 模式唯一权威是客户端的全局/规则开关，剥离订阅与上游配置自带的 mode
+  delete cfg.mode;
   cfg["log-level"] = "warning";
 };
 
 // ====================
 // 7. 主流程
 // ====================
+
 function main(config) {
-  config = ensureConfigObject(config);
+  config = sanitizeConfig(ensureConfigObject(config));
 
   const originalProxies = getOriginalProxies(config);
   const existingRules = Array.isArray(config.rules) ? config.rules : [];
@@ -604,18 +692,19 @@ function main(config) {
   if (originalProxies.length) {
     makeProxyNamesUnique(originalProxies);
 
-    // 1. 先用 CUSTOM_FILTER 过滤掉不想要的节点
-    const filteredProxies = filterCustomProxies(originalProxies, CUSTOM_FILTER);
+    // 1. CUSTOM_FILTER 命中的节点进入 excluded 分类（excluded 优先于 info）
+    const { excludedProxies, keptProxies } = splitCustomProxies(originalProxies, CUSTOM_FILTER);
 
-    // 2. 再用 INFO_FILTER 分离信息节点和正常节点
+    // 2. 用 INFO_FILTER 分离信息节点和普通节点
     const { infoProxies, normalProxies } = splitInfoAndNormalProxies(
-      filteredProxies,
+      keptProxies,
       SETTINGS.INFO_FILTER
     );
 
     const baseProxies = normalProxies;
     const allNames = uniq(baseProxies.map((p) => p.name));
     const infoNames = uniq(infoProxies.map((p) => p.name));
+    const excludedNames = uniq(excludedProxies.map((p) => p.name));
 
     const {
       activeRegions,
@@ -632,10 +721,11 @@ function main(config) {
       activeRegionMap,
       activeRegionNameSet,
       otherProxyNames,
-      infoNames
+      infoNames,
+      excludedNames
     });
 
-    // 保留所有原始节点（包括被 CUSTOM_FILTER 过滤的）
+    // 保留所有原始节点
     config.proxies = originalProxies;
   } else {
     config["proxy-groups"] = buildProxyGroups({
@@ -644,7 +734,8 @@ function main(config) {
       activeRegionMap: new Map(),
       activeRegionNameSet: new Set(),
       otherProxyNames: [],
-      infoNames: []
+      infoNames: [],
+      excludedNames: []
     });
   }
 
